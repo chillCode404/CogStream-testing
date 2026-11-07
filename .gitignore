@@ -1,0 +1,98 @@
+# ==============================================================================
+# Environment & Secrets
+# ==============================================================================
+.env
+.env.*
+*.env
+
+# ==============================================================================
+# Python & Caches
+# ==============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Jupyter & Marimo
+.ipynb_checkpoints/
+.marimo/
+
+# ==============================================================================
+# Virtual Environments
+# ==============================================================================
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# ==============================================================================
+# Model Weights & Checkpoints (Heavy Artifacts)
+# ==============================================================================
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.ckpt
+*.onnx
+
+# Specific training checkpoints & LoRA adapter outputs in this repo
+stage1_lora_weights_custom/
+stage2_lora_weights_custom/
+videollama3_fine_tuning/
+checkpoint_step_*/
+checkpoints/
+
+# ==============================================================================
+# Datasets & Media Files (Videos & Extracted Frames)
+# ==============================================================================
+*.mp4
+*.avi
+*.mkv
+*.mov
+*.webm
+*.flv
+
+# Common local dataset folders
+data/
+datasets/
+video_dir/
+query_dir/
+raw_videos/
+frames/
+
+# ==============================================================================
+# Evaluation Outputs & Experiment Logs
+# ==============================================================================
+evaluate/results/
+results/
+logs/
+wandb/
+
+# ==============================================================================
+# OS & IDE Files
+# ==============================================================================
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
