@@ -273,7 +273,7 @@ if __name__ == "__main__":
           args.model_path,
           trust_remote_code=True,
           torch_dtype=torch.bfloat16, # Compute dtype
-          attn_implementation="flash_attention_2",
+          attn_implementation="sdpa",
           quantization_config=quantization_config,
         )
         if load_from_checkpoint:

@@ -55,18 +55,16 @@ def _(Path, os, subprocess):
         raise ValueError("HF_TOKEN was not found or is invalid in .env")
 
     # ==============================================================================
-    # STEP 1: Ensure git-lfs is Installed
+    # STEP 1: Ensure git-lfs and ffmpeg are Installed
     # ==============================================================================
-    check_lfs = subprocess.run(["which", "git-lfs"], capture_output=True, text=True)
-    if check_lfs.returncode != 0:
-        print("git-lfs not detected. Installing via apt-get...", flush=True)
-        subprocess.run(
-            "apt-get update -qq && apt-get install -y -qq git-lfs", 
-            shell=True, 
-            check=True
-        )
-        subprocess.run(["git", "lfs", "install"], check=True)
-        print("git-lfs installed successfully.\n", flush=True)
+    print("Installing system dependencies (git-lfs, ffmpeg)...", flush=True)
+    subprocess.run(
+        "apt-get update -qq && apt-get install -y -qq git-lfs ffmpeg", 
+        shell=True, 
+        check=True
+    )
+    subprocess.run(["git", "lfs", "install"], check=True)
+    print("System dependencies ready.\n", flush=True)
 
     # ==============================================================================
     # STEP 2: Clone Code Repository
@@ -138,7 +136,7 @@ def _(Path, os, subprocess):
             repo_id="DAMO-NLP-SG/VideoLLaMA3-7B",
             repo_type="model",
             local_dir=str(MODEL_DIR),
-            allow_patterns=["*.safetensors", "*.safetensors.index.json"],
+            allow_patterns=["*.safetensors"],
             max_workers=4,
             token=HF_TOKEN
         )
@@ -238,16 +236,16 @@ def _(Path, os, subprocess):
         print(f"Environment exists at {ENV_PATH}.\n", flush=True)
 
     # ==============================================================================
-    # STEP 2: Install PyTorch 2.4.0 (CUDA 12.4)
+    # STEP 2: Install PyTorch (CUDA 12.8 for Blackwell sm_120)
     # ==============================================================================
-    print("Installing PyTorch 2.4.0 (CUDA 12.4)...", flush=True)
+    print("Installing PyTorch (CUDA 12.8 for Blackwell sm_120)...", flush=True)
     subprocess.run(
         [
             "uv", "pip", "install", 
             "--python", str(ENV_PATH),
-            "--extra-index-url", "https://download.pytorch.org/whl/cu124",
-            "--index-strategy", "unsafe-best-match",
-            "torch==2.4.0", "torchvision==0.19.0", "torchaudio==2.4.0"
+            "--extra-index-url", "https://download.pytorch.org/whl/cu128",
+        "--index-strategy", "unsafe-best-match",
+        "torch==2.7.0", "torchvision==0.22.0", "torchaudio==2.7.0"
         ],
         env=clean_env,
         check=True
@@ -268,6 +266,8 @@ def _(Path, os, subprocess):
         "timm==1.0.3",
         "einops==0.6.1",
         "moviepy==1.0.3",
+        "ffmpeg-python==0.2.0",
+        "imageio-ffmpeg==0.4.9",
         "opencv-python",
         "av",
         "pandas",
@@ -289,36 +289,26 @@ def _(Path, os, subprocess):
     print("Dependencies installed.\n", flush=True)
 
     # ==============================================================================
-    # STEP 4: Install Pre-Built Flash-Attention Wheel
+    # STEP 4: Attention Mechanism Setup (Native SDPA for Blackwell sm_120)
     # ==============================================================================
-    flash_attn_wheel = (
-        "https://github.com/Dao-AILab/flash-attention/releases/download/"
-        "v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.4cxx11abiFALSE-cp310-cp310-linux_x86_64.whl"
-    )
-
-    print("Installing pre-built flash-attn wheel...", flush=True)
-    subprocess.run(
-        ["uv", "pip", "install", "--python", str(ENV_PATH), flash_attn_wheel],
-        env=clean_env,
-        check=True
-    )
-    print("FlashAttention installed.\n", flush=True)
+    print("Using PyTorch native SDPA (Scaled Dot-Product Attention) for Blackwell sm_120.\n", flush=True)
 
     # ==============================================================================
     # STEP 5: Verification (Run with clean_env)
     # ==============================================================================
     verify_cmd = (
-        "import torch, flash_attn, transformers, peft, decord, huggingface_hub, filelock; "
+        "import torch, transformers, peft, decord, huggingface_hub, filelock, ffmpeg; "
         "print('=' * 60); "
         "print(f'Python Executable: {torch.__file__}'); "
         "print(f'HuggingFace Hub:  {huggingface_hub.__file__}'); "
         "print(f'FileLock:         {filelock.__file__}'); "
         "print(f'PyTorch:          {torch.__version__} | CUDA: {torch.cuda.is_available()}'); "
+        "print(f'CUDA Version:     {torch.version.cuda}'); "
         "print(f'GPU Device:       {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"None\"}'); "
-        "print(f'Flash Attention:  {flash_attn.__version__}'); "
         "print(f'Transformers:     {transformers.__version__}'); "
         "print(f'PEFT:             {peft.__version__}'); "
         "print(f'Decord:           {decord.__version__}'); "
+        "print(f'FFmpeg Module:    {ffmpeg.__file__}'); "
         "print('=' * 60); "
         "print('ALL CORE MODULES VERIFIED CLEANLY IN PYTHON 3.10!')"
     )
@@ -389,7 +379,7 @@ def _(Path):
         MODEL_PATH,
         trust_remote_code=True,
         torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
+        attn_implementation="sdpa",
         device_map="cuda:0"
     )
 

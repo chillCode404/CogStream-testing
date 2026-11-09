@@ -174,7 +174,7 @@ if __name__ == "__main__":
         args.model_path,
         trust_remote_code=True,
         torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
+        attn_implementation="sdpa",
     )
     processor = AutoProcessor.from_pretrained(args.model_path, trust_remote_code=True)
     tokenizer = processor.tokenizer
