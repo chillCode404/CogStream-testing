@@ -555,8 +555,8 @@ if __name__ == "__main__":
         warmup_ratio=0.08,
         gradient_accumulation_steps=4,
         num_train_epochs=1,
-        logging_strategy="step",
-        logging_step=20,
+        logging_strategy="steps",
+        logging_steps=20,
         save_strategy="epoch",
         bf16=True,
         remove_unused_columns=False,
@@ -564,7 +564,6 @@ if __name__ == "__main__":
         gradient_checkpointing=True,  
         dataloader_num_workers=2,     
         ddp_find_unused_parameters=False,
-        resume_from_checkpoint=False,
         report_to=None
     )
     trainer = ConstrainedTrainer(
