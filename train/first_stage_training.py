@@ -43,7 +43,7 @@ def load_json(folder_path):
             file_path = os.path.join(folder_path, json_file)
             with open(file_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-                all_data.append(data)
+                all_data.append((json_file, data))
     
     return all_data
 class StopTrainingCallback(TrainerCallback):
@@ -330,16 +330,62 @@ class ConstrainedTrainer(Trainer):
         return (outputs.loss, outputs) if return_outputs else outputs.loss
 
 class FlattenedQADataset(torch.utils.data.Dataset):
-    def __init__(self, all_data, shuffle=True):
+    def __init__(self, all_data, shuffle=True, audit_file="qa_format_audit.json"):
  
         self.samples = []
+        audit_report = {
+            "rescued_dict_files": [],
+            "rescued_1d_list_files": [],
+            "skipped_entries": [],
+        }
+
         if shuffle:
             random.shuffle(all_data)
-        for original_data in all_data:
+        for entry in all_data:
+            if isinstance(entry, tuple) and len(entry) == 2:
+                json_file, original_data = entry
+            else:
+                json_file, original_data = "unknown", entry
+
+            # 1. If wrapped in a dict with 'Data', unwrap it
+            if isinstance(original_data, dict):
+                audit_report["rescued_dict_files"].append(json_file)
+                original_data = original_data.get("Data", [original_data])
+            # 2. If it's a flat 1D list of dicts [ {"Q": ...}, ... ], wrap into 2D [ [ {"Q": ...} ] ]
+            if isinstance(original_data, list) and len(original_data) > 0 and isinstance(original_data[0], dict):
+                audit_report["rescued_1d_list_files"].append(json_file)
+                original_data = [original_data]
+
+            if not isinstance(original_data, list):
+                audit_report["skipped_entries"].append({
+                    "file": json_file,
+                    "reason": f"Expected list at top-level but got {type(original_data).__name__}"
+                })
+                continue
+
             if shuffle:
                 random.shuffle(original_data)
-            for group in original_data:
+                
+            for group_idx, group in enumerate(original_data):
+                if not isinstance(group, list):
+                    audit_report["skipped_entries"].append({
+                        "file": json_file,
+                        "group_idx": group_idx,
+                        "reason": f"Expected group to be list but got {type(group).__name__}"
+                    })
+                    continue
+
                 for i, qa_pair in enumerate(group):
+                    if not isinstance(qa_pair, dict) or "Q" not in qa_pair or "info" not in qa_pair:
+                        audit_report["skipped_entries"].append({
+                            "file": json_file,
+                            "group_idx": group_idx,
+                            "item_idx": i,
+                            "reason": "Missing required 'Q' or 'info' dictionary keys",
+                            "raw": str(qa_pair)[:100]
+                        })
+                        continue
+
                     current_Q = qa_pair["Q"]
                     current_ID = qa_pair["info"]["ID"]
                     if_visual = qa_pair["info"]["is_visual"]
@@ -367,7 +413,21 @@ class FlattenedQADataset(torch.utils.data.Dataset):
                     }
                     self.samples.append(item)
         
+        # Save audit report to disk
+        audit_report["total_samples_loaded"] = len(self.samples)
+        audit_report["total_skipped"] = len(audit_report["skipped_entries"])
+        try:
+            with open(audit_file, "w", encoding="utf-8") as f:
+                json.dump(audit_report, f, indent=4)
+        except Exception as e:
+            print(f"Warning: Could not save audit file {audit_file}: {e}")
+
         print(f"[FlattenedQADataset] total {len(self.samples)} items.")
+        print(f"[FlattenedQADataset] Formats rescued: {len(audit_report['rescued_dict_files'])} dicts, {len(audit_report['rescued_1d_list_files'])} 1D lists.")
+        if audit_report["total_skipped"] > 0:
+            print(f"[FlattenedQADataset] ⚠️ Warning: {audit_report['total_skipped']} non-QA entries skipped. Details saved to {audit_file}")
+        else:
+            print(f"[FlattenedQADataset] Audit report saved to {audit_file}.")
     
     def __len__(self):
         return len(self.samples)
@@ -431,7 +491,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run VideoLLaMA3 QA selection module training.")
     parser.add_argument("--model_path", type=str, default="model", help="Path to the base model directory.")
     parser.add_argument("--QA_path", type=str, help="Path to the QA directory.")
-    parser.add_argument("-resume_from_checkpoint", type=str, default=None, help="Path to previous LoRA adapter or trainer checkpoint to continue training.")
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Path to previous LoRA adapter or trainer checkpoint to continue training.")
     args = parser.parse_args()
     model_path = args.model_path
     processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
