@@ -488,6 +488,7 @@ if __name__ == "__main__":
     world_size = int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ["LOCAL_RANK"])
     setup(global_rank, world_size)
+    os.makedirs(os.path.expanduser("~/.triton/autotune"), exist_ok=True)
     parser = argparse.ArgumentParser(description="Run VideoLLaMA3 QA selection module training.")
     parser.add_argument("--model_path", type=str, default="model", help="Path to the base model directory.")
     parser.add_argument("--QA_path", type=str, help="Path to the QA directory.")
@@ -562,7 +563,7 @@ if __name__ == "__main__":
         remove_unused_columns=False,
         dataloader_pin_memory=False,
         gradient_checkpointing=True,  
-        dataloader_num_workers=2,     
+        dataloader_num_workers=0,     
         ddp_find_unused_parameters=False,
         report_to=None
     )
