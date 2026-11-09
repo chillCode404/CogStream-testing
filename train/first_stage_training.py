@@ -470,9 +470,9 @@ if __name__ == "__main__":
     model.config.use_cache = False
     for name, param in model.named_parameters():
         if "lora" not in name:
-            assert not param.requires_grad, f"Non-LoRA参数 {name} 未冻结！"
+            assert not param.requires_grad, f"Non-LoRA parameter {name} is not frozen!"
         else:
-            assert param.requires_grad, f"LoRA参数 {name} 未启用梯度！"
+            assert param.requires_grad, f"LoRA parameter {name} does not have gradients enabled!"
     trainable_params, total_params = count_trainable_parameters(model)
     print("total_params:", total_params, "trainable_params:", trainable_params)
     train_dataset = load_json(args.QA_path)
@@ -480,13 +480,13 @@ if __name__ == "__main__":
     logits_processor = LogitsProcessorList([StructuredLogitsProcessor(tokenizer)])
     training_args = TrainingArguments(
         output_dir="./stage1_lora_weights_custom",
-        per_device_train_batch_size=1,
+        per_device_train_batch_size=8,
         learning_rate=2e-4,
         lr_scheduler_type="cosine",
         max_grad_norm=0.5,
         warmup_ratio=0.08,
         gradient_accumulation_steps=4,
-        num_train_epochs=8,
+        num_train_epochs=1,
         logging_strategy="epoch",
         save_strategy="epoch",
         bf16=True,
