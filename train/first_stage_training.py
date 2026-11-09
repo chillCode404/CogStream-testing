@@ -431,6 +431,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run VideoLLaMA3 QA selection module training.")
     parser.add_argument("--model_path", type=str, default="model", help="Path to the base model directory.")
     parser.add_argument("--QA_path", type=str, help="Path to the QA directory.")
+    parser.add_argument("-resume_from_checkpoint", type=str, default=None, help="Path to previous LoRA adapter or trainer checkpoint to continue training.")
     args = parser.parse_args()
     model_path = args.model_path
     processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
@@ -465,7 +466,14 @@ if __name__ == "__main__":
     )
 
     base_model.enable_input_require_grads()
-    model = get_peft_model(base_model, lora_config)
+    # model = get_peft_model(base_model, lora_config)
+    if args.resume_from_checkpoint and os.path.exists(args.resume_from_checkpoint):
+        print(f"Loading existing LoRA weights from {args.resume_from_checkpoint} to continue training...")
+        model = PeftModel.from_pretrained(base_model, args.resume_from_checkpoint, is_trainable=True)
+    else:
+        print("Initializing fresh LoRA weights...")
+        model = get_peft_model(base_model, lora_config)
+    
     model = model.to(local_rank)
     model.config.use_cache = False
     for name, param in model.named_parameters():
@@ -487,7 +495,8 @@ if __name__ == "__main__":
         warmup_ratio=0.08,
         gradient_accumulation_steps=4,
         num_train_epochs=1,
-        logging_strategy="epoch",
+        logging_strategy="step",
+        logging_step=20,
         save_strategy="epoch",
         bf16=True,
         remove_unused_columns=False,

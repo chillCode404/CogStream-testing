@@ -138,6 +138,7 @@ def _(Path, os, subprocess):
             repo_id="DAMO-NLP-SG/VideoLLaMA3-7B",
             repo_type="model",
             local_dir=str(MODEL_DIR),
+            allow_patterns=["*.safetensors", "*.safetensors.index.json"],
             max_workers=4,
             token=HF_TOKEN
         )
@@ -427,7 +428,12 @@ def _(Path):
 
     # 4. Generate Output
     prompt = processor.apply_chat_template(conversation, add_generation_prompt=True, tokenize=False)
-    inputs = processor(text=prompt, videos=[sample_video_path] if video_files else None, return_tensors="pt").to("cuda:0")
+    inputs = processor(
+        conversation=conversation,
+        add_system_prompt=True,
+        add_generation_prompt=True,
+        return_tensors="pt"
+    ).to("cuda:0")
 
     print("\\nGenerating model response...", flush=True)
     with torch.inference_mode():
@@ -467,24 +473,19 @@ def _(PYTHON_BIN, clean_env, subprocess):
 def _(mo):
     mo.md(r"""
     # Testing CogReasoner
-    """)
-    return
-
-
-@app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
     ## Testing with Zero-shot Model
     - Note: current code does not support running without LoRA modules yet.
+    - Need at least the LoRA module for historic dialogue retrieval.
+    - TODO: train HDR module (for 1-2 epoch for example usage), then find way to run without LoRA for video-text interleaved reasoning.
     """)
     return
 
 
 @app.cell
-def _(PYTHON_BIN, ROOT_DIR, clean_env, subprocess):
+def _(ROOT_DIR, TORCHRUN_BIN, clean_env, subprocess):
     # Launch zero-shot baseline evaluation
     zero_shot_cmd = [
-        PYTHON_BIN,
+        TORCHRUN_BIN,
         "evaluate/answer_generate.py",
         "--model_path", "./model",
         "--video_dir", "./Dataset/Test_dataset/event_segments",
@@ -518,9 +519,10 @@ def _(ROOT_DIR, TORCHRUN_BIN, clean_env, subprocess):
     stage1_cmd = [
         TORCHRUN_BIN,
         "--nproc_per_node=1",
-        "train/language_model_training.py",
+        "train/first_stage_training.py",
         "--model_path", "./model",
-        "--QA_path", "./Dataset/Train_dataset/QA_Dataset"
+        "--QA_path", "./Dataset/Train_dataset/QA_Dataset",
+        "--resume_from_checkpoint", "./stage1_lora_weights_custom"
     ]
 
     print("Starting Stage 1 training (Historic Dialogue Retrieval)...", flush=True)
@@ -549,8 +551,9 @@ def _(ACCELERATE_BIN, ROOT_DIR, clean_env, subprocess):
     stage2_cmd = [
         ACCELERATE_BIN,
         "launch",
-        "--config_file", "default_configs.yaml",
+        "--config_file", "default_config.yaml",
         "--num_processes=1",  # Overrides 'num_processes: 8' for your single Blackwell GPU
+        "--num_epochs=1", # train for 1 epoch to test the results first.
         "--main_process_port=29501",
         "train/second_stage_training.py",
         "--model_path", "./model",
