@@ -97,12 +97,14 @@ def _(Path, os, subprocess):
     dataset_sync_script = f"""
     set -e
     git lfs install
+    git config --global lfs.concurrenttransfers 16
+    git config --global http.postBuffer 1048576000
 
     # Case 1: First-time session (folder does not exist)
     if [ ! -d "{DATASET_DIR}" ]; then
+        echo "Cloning dataset metadata and repository structure..."
         GIT_LFS_SKIP_SMUDGE=1 git clone {dataset_auth_url} {DATASET_DIR}
         cd {DATASET_DIR}
-        git lfs pull
 
     # Case 2: Folder exists from snapshot_download, but has no .git folder
     elif [ ! -d "{DATASET_DIR}/.git" ]; then
@@ -111,14 +113,20 @@ def _(Path, os, subprocess):
         git init
         git remote add origin {dataset_auth_url}
         git fetch origin main
-        git reset origin/main
-        git lfs pull
 
     # Case 3: Already a Git repository
     else
+        echo "Existing repository detected. Fetching latest remote commits..."
         cd {DATASET_DIR}
-        git lfs pull
+        git fetch origin main || true
     fi
+
+    # ALWAYS guarantee all tracked JSON files and metadata are restored cleanly on disk
+    echo "Restoring and verifying all tracked JSON and metadata files..."
+    git reset --hard origin/main
+
+    echo "Pulling video binary files (Git LFS) with 16 parallel streams..."
+    git lfs pull
     """
 
     subprocess.run(dataset_sync_script, shell=True, executable="/bin/bash", check=True)
@@ -239,6 +247,7 @@ def _(Path, os, subprocess):
     clean_env["PATH"] = f"{ENV_PATH / 'bin'}:{clean_env.get('PATH', '')}"
     # allow pytorch expandable segments to reclaim fragmented gpu mem.
     clean_env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    clean_env["PYTHONUNBUFFERED"] = "1"
 
     # ==============================================================================
     # STEP 1: Create Isolated Python 3.10 Virtual Environment

@@ -187,6 +187,7 @@ class CustomDataCollator:
                             print(item["current_Q"])
                             print(indices)
                             print(item["labels_01"])
+                            continue
                         shuf_labels = [item["labels_01"][i] for i in indices]
                         unique_shuffles.add(tuple(zip(shuf_Qs, shuf_As, shuf_labels)))
                     
@@ -404,6 +405,17 @@ class FlattenedQADataset(torch.utils.data.Dataset):
                     hist_As = [x["A"] for x in group[:i]]
                     
                     if current_ID == 0:
+                        continue
+
+                    if len(labels_01) != len(hist_Qs):
+                        audit_report["skipped_entries"].append({
+                            "file": json_file,
+                            "group_idx": group_idx,
+                            "item_idx": i,
+                            "question": current_Q,
+                            "reason": f"Mismatched label length: len(labels_01)={len(labels_01)} vs len(hist_Qs)={len(hist_Qs)}",
+                            "raw": str(qa_pair)[:100]
+                        })
                         continue
                     item = {
                         "current_Q": current_Q,
