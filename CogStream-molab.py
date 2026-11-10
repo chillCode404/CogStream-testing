@@ -162,6 +162,17 @@ def _(Path, os, subprocess):
 
 
 @app.cell
+def _(ROOT_DIR, clean_env, subprocess):
+    subprocess.run(
+        ["git", "pull", "origin", "main"],
+        cwd=str(ROOT_DIR),
+        env=clean_env,
+        check=True
+    )
+    return
+
+
+@app.cell
 def _(DATASET_DIR, subprocess):
     # DATASET_DIR = Path("./CogStream-testing/Dataset").resolve()
 
@@ -220,6 +231,8 @@ def _(Path, os, subprocess):
     clean_env.pop("PYTHONHOME", None)
     clean_env["VIRTUAL_ENV"] = str(ENV_PATH)
     clean_env["PATH"] = f"{ENV_PATH / 'bin'}:{clean_env.get('PATH', '')}"
+    # allow pytorch expandable segments to reclaim fragmented gpu mem.
+    clean_env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
     # ==============================================================================
     # STEP 1: Create Isolated Python 3.10 Virtual Environment

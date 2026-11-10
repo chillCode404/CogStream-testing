@@ -1,7 +1,10 @@
+# enable expandable segment for pytorch to reuse fragmented gpu mem segments
+import os
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import torch
 import json
 import re
-import os
 import numpy as np
 import random
 from torch.distributed import init_process_group
@@ -278,12 +281,11 @@ class ConstrainedTrainer(Trainer):
         )
         if self.logits_processor is not None:
             logits = outputs.logits
-            processed_logits = logits.clone()
             for processor in self.logits_processor:
-                processed_logits = processor(inputs["input_ids"], processed_logits)
-        outputs.logits = processed_logits
+                logits = processor(inputs["input_ids"], logits)
+            outputs.logits = logits
 
-        shift_logits = outputs.logits[..., :-1, :].contiguous()
+        shift_logits = outputs.logits[..., :-1, :]
         shift_labels = inputs["labels"][..., 1:].contiguous()
         if print_test:
                 print(f"Shift Labels Length: {len(shift_labels[0])}")
@@ -320,7 +322,7 @@ class ConstrainedTrainer(Trainer):
 
         loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100)
         loss = loss_fct(
-            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_logits.reshape(-1, shift_logits.size(-1)),
             shift_labels.view(-1)
         )
         if print_test:
@@ -438,6 +440,7 @@ class FlattenedQADataset(torch.utils.data.Dataset):
 class StructuredLogitsProcessor(LogitsProcessor):
     def __init__(self, tokenizer):
         self.allowed_token_ids = self._get_allowed_token_ids(tokenizer)
+        self.mask_1d = None
 
     def _get_allowed_token_ids(self, tokenizer):
         special_tokens = [str(i) for i in range(10)] + ['[', ']', ',', '<|im_end|>', 'no', 'yes']
@@ -450,9 +453,17 @@ class StructuredLogitsProcessor(LogitsProcessor):
         return sorted(list(allowed_ids))
 
     def __call__(self, input_ids, scores):
-        mask = torch.full_like(scores, float('-inf'))
-        mask[..., self.allowed_token_ids] = 0
-        return scores + mask
+        vocab_size = scores.shape[-1]
+        if (
+            self.mask_1d is None
+            or self.mask_1d.device != scores.device
+            or self.mask_1d.dtype != scores.dtype
+            or self.mask_1d.shape[0] != vocab_size
+        ):
+            mask = torch.full((vocab_size,), float('-inf'), dtype=scores.dtype, device=scores.device)
+            mask[self.allowed_token_ids] = 0
+            self.mask_1d = mask
+        return scores + self.mask_1d
 
 def compute_metrics(eval_pred):
     preds, labels = eval_pred
@@ -549,7 +560,7 @@ if __name__ == "__main__":
     logits_processor = LogitsProcessorList([StructuredLogitsProcessor(tokenizer)])
     training_args = TrainingArguments(
         output_dir="./stage1_lora_weights_custom",
-        per_device_train_batch_size=8,
+        per_device_train_batch_size=4,
         learning_rate=2e-4,
         lr_scheduler_type="cosine",
         max_grad_norm=0.5,
