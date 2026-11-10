@@ -569,7 +569,9 @@ if __name__ == "__main__":
         num_train_epochs=1,
         logging_strategy="steps",
         logging_steps=20,
-        save_strategy="epoch",
+        save_strategy="steps",
+        save_steps=500,
+        save_total_limit=3,
         bf16=True,
         remove_unused_columns=False,
         dataloader_pin_memory=False,
@@ -587,5 +589,5 @@ if __name__ == "__main__":
         data_collator=CustomDataCollator(tokenizer, eval_mode=False),
         callbacks=[EpochLossCallback()]
     )
-    trainer.train()
+    trainer.train(resume_from_checkpoint=True)
     
