@@ -70,7 +70,7 @@ def _(Path, os, subprocess):
     # STEP 2: Clone Code Repository
     # ==============================================================================
     REPO_URL = "https://github.com/chillCode404/CogStream-testing.git"
-    ROOT_DIR = Path("./CogStream-testing")
+    ROOT_DIR = Path("./CogStream-testing").resolve()
     DATASET_DIR = ROOT_DIR / "Dataset"
     MODEL_DIR = ROOT_DIR / "model"
 
@@ -79,7 +79,13 @@ def _(Path, os, subprocess):
         subprocess.run(["git", "clone", REPO_URL, str(ROOT_DIR)], check=True)
         print("Code repository ready.\n", flush=True)
     else:
-        print("Code repository already exists. Skipping clone.\n", flush=True)
+        print("Code repository already exists. Ensuring all tracked files are checked out...", flush=True)
+        subprocess.run(
+        ["git", "checkout", "HEAD", "--", "model/"],
+        cwd=ROOT_DIR,
+        check=True
+    )
+
 
     # ==============================================================================
     # STEP 3: Sync Dataset via Git LFS (Safe Resume)
