@@ -538,8 +538,12 @@ if __name__ == "__main__":
     )
 
     base_model.enable_input_require_grads()
-    # model = get_peft_model(base_model, lora_config)
-    if args.resume_from_checkpoint and os.path.exists(args.resume_from_checkpoint):
+    has_adapter = (
+        args.resume_from_checkpoint
+        and os.path.isdir(args.resume_from_checkpoint)
+        and os.path.isfile(os.path.join(args.resume_from_checkpoint, "adapter_config.json"))
+    )
+    if has_adapter:
         print(f"Loading existing LoRA weights from {args.resume_from_checkpoint} to continue training...")
         model = PeftModel.from_pretrained(base_model, args.resume_from_checkpoint, is_trainable=True)
     else:
@@ -589,5 +593,17 @@ if __name__ == "__main__":
         data_collator=CustomDataCollator(tokenizer, eval_mode=False),
         callbacks=[EpochLossCallback()]
     )
-    trainer.train(resume_from_checkpoint=True)
+    resume_checkpoint = None
+    if os.path.isdir(training_args.output_dir):
+        checkpoints = [
+            os.path.join(training_args.output_dir, d)
+            for d in os.listdir(training_args.output_dir)
+            if d.startswith("checkpoint-") and os.path.isdir(os.path.join(training_args.output_dir, d))
+        ]
+        if checkpoints:
+            checkpoints.sort(key=lambda x: int(x.split("-")[-1]))
+            resume_checkpoint = checkpoints[-1]
+            print(f"Found existing training checkpoint: {resume_checkpoint}. Resuming training...")
+
+    trainer.train(resume_from_checkpoint=resume_checkpoint)
     
