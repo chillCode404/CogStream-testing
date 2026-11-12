@@ -543,16 +543,48 @@ def _(ROOT_DIR, TORCHRUN_BIN, clean_env, subprocess):
         "--resume_from_checkpoint", "./stage1_lora_weights_custom"
     ]
 
-    print("Starting Stage 1 training (Historic Dialogue Retrieval)...", flush=True)
+    log_file = ROOT_DIR / "stage1_training.log"
+    print(f"Starting Stage 1 training (Historic Dialogue Retrieval)...", flush=True)
+    print(f"All output is being written to: {log_file}", flush=True)
+    print(f"Monitor in real time from the Molab terminal with:", flush=True)
+    print(f"    tail -f {log_file}", flush=True)
 
-    subprocess.run(
-        stage1_cmd,
-        cwd=str(ROOT_DIR),    # Must be run from repo root for path resolution
-        env=clean_env,        # Enforces Python 3.10 isolation
-        check=True
-    )
+    with open(log_file, "w") as f:
+        result = subprocess.run(
+            stage1_cmd,
+            cwd=str(ROOT_DIR),
+            env=clean_env,
+            stdout=f,
+            stderr=subprocess.STDOUT,
+        )
 
-    print("Stage 1 training completed successfully.", flush=True)
+    # Print the tail of the log so the cell shows final status
+    with open(log_file, "r") as f:
+        lines = f.readlines()
+        tail = lines[-50:] if len(lines) > 50 else lines
+        print("\n--- Last 50 lines of training log ---", flush=True)
+        for line in tail:
+            print(line, end="", flush=True)
+
+    if result.returncode != 0:
+        raise subprocess.CalledProcessError(result.returncode, stage1_cmd)
+    return
+
+
+@app.cell
+def _(ROOT_DIR):
+    """Run this cell to check training progress while the training cell is running."""
+    log_file = ROOT_DIR / "stage1_training.log"
+    if log_file.exists():
+        with open(log_file, "r") as f:
+            lines = f.readlines()
+        # Show last 30 lines
+        tail = lines[-30:] if len(lines) > 30 else lines
+        print(f"--- {log_file} ({len(lines)} lines total, showing last {len(tail)}) ---")
+        for line in tail:
+            print(line, end="")
+    else:
+        print(f"No log file found at {log_file}. Training has not started yet.")
     return
 
 

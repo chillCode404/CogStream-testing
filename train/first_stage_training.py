@@ -7,6 +7,23 @@ import json
 import re
 import numpy as np
 import random
+
+# Monkey-patch torch.load to fallback to weights_only=False for trusted local checkpoints (PyTorch 2.6+ rng_state.pth compatibility)
+_original_torch_load = torch.load
+
+def _safe_torch_load(*args, **kwargs):
+    try:
+        return _original_torch_load(*args, **kwargs)
+    except Exception as e:
+        # If weights_only caused unpickling error, retry with weights_only=False
+        if "weights_only" in kwargs:
+            kwargs["weights_only"] = False
+            return _original_torch_load(*args, **kwargs)
+        elif len(args) < 3:  # weights_only is the 3rd positional or keyword argument
+            return _original_torch_load(*args, weights_only=False, **kwargs)
+        raise e
+
+torch.load = _safe_torch_load
 from torch.distributed import init_process_group
 from transformers import (
     AutoModelForCausalLM,
