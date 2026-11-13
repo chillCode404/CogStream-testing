@@ -560,10 +560,16 @@ def _(mo):
 
 @app.cell
 def _(ROOT_DIR, TORCHRUN_BIN, clean_env, fs, subprocess):
+    import hashlib as _hashlib
+    import json as _json
+    import re as _re
     from collections import deque
+    from pathlib import Path as _Path
     from queue import Empty, SimpleQueue
+    from tempfile import TemporaryDirectory as _TemporaryDirectory
     from threading import Event, Thread, enumerate as _enumerate_threads
     from time import monotonic
+    from uuid import uuid4 as _uuid4
 
     # A timed-out wait does not kill an in-flight HTTP request. Refuse a rerun
     # while the previous worker is still alive, before touching fs or the log.
@@ -590,6 +596,101 @@ def _(ROOT_DIR, TORCHRUN_BIN, clean_env, fs, subprocess):
     _cancel_sync = Event()
     _sync_busy = Event()
     _sync_messages = SimpleQueue()
+    _manifest_name = "_checkpoint_manifest.json"
+
+    def _checkpoint_step(name):
+        if not _re.fullmatch(r"checkpoint-\d+", name):
+            raise ValueError(f"Invalid checkpoint directory name: {name}")
+        return int(name.split("-")[-1])
+
+    def _check_sync_cancelled():
+        if _cancel_sync.is_set():
+            raise RuntimeError("Drive sync was cancelled")
+
+    def _check_required_files(files):
+        # These names match this launcher's single-process, non-DeepSpeed,
+        # bf16 LoRA Trainer configuration (transformers 4.46.3). Adapter weights
+        # alone are insufficient to resume the optimizer, LR schedule, and RNG.
+        required = {
+            "adapter_config.json", "trainer_state.json", "training_args.bin",
+            "optimizer.pt", "scheduler.pt", "rng_state.pth",
+        }
+        missing = required - files.keys()
+        if missing:
+            raise ValueError(f"Missing resume files: {', '.join(sorted(missing))}")
+        if not {"adapter_model.safetensors", "adapter_model.bin"}.intersection(files):
+            raise ValueError("Missing LoRA adapter weights")
+        for name, details in files.items():
+            # Manifests must describe flat checkpoint files, never paths outside
+            # the staging directory or the manifest itself.
+            if not isinstance(name, str) or name in {"", ".", "..", _manifest_name} or "/" in name or "\\" in name:
+                raise ValueError(f"Invalid checkpoint filename: {name!r}")
+            if not isinstance(details, dict) or type(details.get("size")) is not int or details["size"] <= 0:
+                raise ValueError(f"Missing/empty file or invalid size: {name}")
+
+    def _check_manifest(manifest, checkpoint_name):
+        if not isinstance(manifest, dict) or manifest.get("version") != 1 or manifest.get("complete") is not True:
+            raise ValueError("Checkpoint manifest is invalid or upload is incomplete")
+        if manifest.get("checkpoint") != checkpoint_name or type(manifest.get("global_step")) is not int:
+            raise ValueError("Checkpoint manifest identifies a different checkpoint")
+        if manifest["global_step"] != _checkpoint_step(checkpoint_name):
+            raise ValueError("Checkpoint manifest step does not match its directory")
+        files = manifest.get("files")
+        if not isinstance(files, dict):
+            raise ValueError("Checkpoint manifest has no file inventory")
+        _check_required_files(files)
+        for name, details in files.items():
+            if not isinstance(details.get("sha256"), str) or not _re.fullmatch(r"[0-9a-f]{64}", details["sha256"]):
+                raise ValueError(f"Invalid SHA-256 checksum for {name}")
+
+    def _checkpoint_snapshot(directory):
+        step = _checkpoint_step(directory.name)
+        files = {}
+        for path in sorted(directory.iterdir()):
+            if path.name == _manifest_name:
+                continue
+            if not path.is_file() or path.is_symlink():
+                raise ValueError(f"Unsupported checkpoint entry: {path.name}")
+            files[path.name] = {"size": path.stat().st_size}
+        _check_required_files(files)
+        state = _json.loads((directory / "trainer_state.json").read_text(encoding="utf-8"))
+        config = _json.loads((directory / "adapter_config.json").read_text(encoding="utf-8"))
+        if not isinstance(state, dict) or type(state.get("global_step")) is not int or state["global_step"] != step:
+            raise ValueError("trainer_state.json step does not match its directory")
+        if not isinstance(config, dict) or not config:
+            raise ValueError("adapter_config.json must contain a configuration object")
+        for name, details in files.items():
+            # Stream hashes in small blocks: optimizer checkpoints can be large.
+            # Do not load torch/pickle files merely to check transport integrity.
+            digest = _hashlib.sha256()
+            with open(directory / name, "rb") as source:
+                while block := source.read(1024 * 1024):
+                    _check_sync_cancelled()
+                    digest.update(block)
+            details["sha256"] = digest.hexdigest()
+        return {"version": 1, "complete": True, "checkpoint": directory.name, "global_step": step, "files": files}
+
+    def _validate_local_checkpoint(directory):
+        snapshot = _checkpoint_snapshot(directory)
+        marker = directory / _manifest_name
+        if marker.exists():
+            manifest = _json.loads(marker.read_text(encoding="utf-8"))
+            _check_manifest(manifest, directory.name)
+            if manifest["files"] != snapshot["files"]:
+                raise ValueError("Local checkpoint size/SHA-256 mismatch")
+        return snapshot
+
+    def _remote_files(directory):
+        # Refresh listings after writes; cached sizes cannot verify an upload.
+        fs.invalidate_cache(directory)
+        files = {}
+        for info in fs.ls(directory, detail=True):
+            if info.get("type") != "directory":
+                name = info["name"].rstrip("/").split("/")[-1]
+                if name in files:
+                    raise ValueError(f"Ambiguous duplicate Drive filename: {name}")
+                files[name] = info
+        return files
 
     def _drain_sync_messages():
         # Print from the cell's thread so worker messages reach notebook output.
@@ -603,42 +704,129 @@ def _(ROOT_DIR, TORCHRUN_BIN, clean_env, fs, subprocess):
         if not _cancel_sync.is_set() and local_path.is_file():
             try:
                 fs.put(str(local_path), remote_path)
+                return True
             except Exception as e:
                 _sync_messages.put(f"[Drive Sync Warning] Failed to upload {local_path.name}: {e}")
+        return False
 
-    def _upload_dir(local_dir, remote_target):
+    def _upload_checkpoint(local_dir, remote_target):
         if _cancel_sync.is_set():
-            return
+            return False
         try:
+            manifest = _validate_local_checkpoint(local_dir)
             fs.makedirs(remote_target, exist_ok=True)
-            for item in local_dir.iterdir():
-                if _cancel_sync.is_set():
-                    return
-                if item.is_file():
-                    fs.put(str(item), f"{remote_target}/{item.name}")
+            with _TemporaryDirectory(prefix="cogstream-manifest-") as temporary:
+                marker = _Path(temporary) / _manifest_name
+                # Invalidate any previous completion marker BEFORE overwriting
+                # payloads. This also distinguishes interrupted new uploads from
+                # older, pre-manifest backups that may still be recoverable.
+                marker.write_text(_json.dumps({**manifest, "complete": False}), encoding="utf-8")
+                _check_sync_cancelled()
+                fs.put(str(marker), f"{remote_target}/{_manifest_name}")
+                for name in manifest["files"]:
+                    _check_sync_cancelled()
+                    fs.put(str(local_dir / name), f"{remote_target}/{name}")
+                _check_sync_cancelled()
+                remote_files = _remote_files(remote_target)
+                for name, details in manifest["files"].items():
+                    if remote_files.get(name, {}).get("size") != details["size"]:
+                        raise ValueError(f"Uploaded file size mismatch: {name}")
+                # Trainer may rotate/delete a checkpoint during a slow upload.
+                # Publish completion only if its local contents are unchanged.
+                if _checkpoint_snapshot(local_dir) != manifest:
+                    raise ValueError("Local checkpoint changed during upload")
+                marker.write_text(_json.dumps(manifest, sort_keys=True), encoding="utf-8")
+                _check_sync_cancelled()
+                fs.put(str(marker), f"{remote_target}/{_manifest_name}")
+                _check_sync_cancelled()
+                verified_marker = _Path(temporary) / "verified-manifest.json"
+                fs.get(f"{remote_target}/{_manifest_name}", str(verified_marker))
+                if _json.loads(verified_marker.read_text(encoding="utf-8")) != manifest:
+                    raise ValueError("Uploaded completion manifest failed read-back validation")
+            _sync_messages.put(f"[Drive Sync] Validated backup: {local_dir.name}.")
+            return True
         except Exception as e:
-            _sync_messages.put(f"[Drive Sync Warning] Failed to upload {local_dir.name}: {e}")
+            _sync_messages.put(f"[Drive Sync Warning] Backup of {local_dir.name} was not confirmed; will retry on a later pass: {e}")
+            return False
 
-    # 1. Restore existing checkpoints from Google Drive if local directory has none
-    local_ckpts = list(local_ckpt_dir.glob("checkpoint-*")) if local_ckpt_dir.exists() else []
+    # Trainer chooses the highest checkpoint-* directory without validating it.
+    # Move invalid local directories out of that namespace, preserving their
+    # contents for inspection rather than deleting potentially useful weights.
+    uploaded_ckpts = set()
+    local_ckpts = []
+    # Remember rejected local checkpoints across cell reruns too. Moving a bad
+    # directory aside must not make the next run silently start from scratch.
+    _quarantine_dir = local_ckpt_dir / ".incomplete"
+    _had_invalid_checkpoint = _quarantine_dir.is_dir() and any(_quarantine_dir.iterdir())
+    for candidate in sorted(local_ckpt_dir.glob("checkpoint-*")):
+        if not candidate.is_dir():
+            continue
+        try:
+            _validate_local_checkpoint(candidate)
+            local_ckpts.append(candidate)
+        except Exception as e:
+            _had_invalid_checkpoint = True
+            _quarantine_dir.mkdir(exist_ok=True)
+            preserved = _quarantine_dir / f"{candidate.name}-{_uuid4().hex}"
+            candidate.rename(preserved)
+            print(f"[Checkpoint Warning] Preserved invalid {candidate.name} at {preserved}: {e}", flush=True)
+
+    # Restore only the newest VALID remote checkpoint. Download into a hidden
+    # staging directory on the same filesystem, then rename it atomically so a
+    # failed/interrupted download cannot become Trainer's next resume candidate.
     if not local_ckpts and fs.exists(remote_dir):
-        print(f"Checking {remote_dir} for existing checkpoints to resume...", flush=True)
-        for info in fs.ls(remote_dir, detail=True):
+        print(f"Checking {remote_dir} for validated checkpoints to resume...", flush=True)
+        candidates = [
+            info for info in fs.ls(remote_dir, detail=True)
+            if info.get("type") == "directory"
+            and _re.fullmatch(r"checkpoint-\d+", info["name"].rstrip("/").split("/")[-1])
+        ]
+        candidates.sort(key=lambda info: _checkpoint_step(info["name"].rstrip("/").split("/")[-1]), reverse=True)
+        for info in candidates:
             name = info["name"].rstrip("/").split("/")[-1]
-            if info.get("type") == "directory" and name.startswith("checkpoint-"):
-                target_dir = local_ckpt_dir / name
-                target_dir.mkdir(parents=True, exist_ok=True)
-                print(f"Downloading {name} from Google Drive...", flush=True)
-                for f_info in fs.ls(info["name"], detail=True):
-                    if f_info.get("type") != "directory":
-                        fname = f_info["name"].rstrip("/").split("/")[-1]
-                        fs.get(f_info["name"], str(target_dir / fname))
-
-
-    uploaded_ckpts = {
-        p.name for p in local_ckpt_dir.glob("checkpoint-*")
-        if (p / "trainer_state.json").is_file()
-    } if local_ckpt_dir.exists() else set()
+            try:
+                remote_files = _remote_files(info["name"])
+                local_ckpt_dir.mkdir(parents=True, exist_ok=True)
+                with _TemporaryDirectory(dir=local_ckpt_dir, prefix=".restore-") as temporary:
+                    staged = _Path(temporary) / name
+                    staged.mkdir()
+                    manifest = None
+                    if _manifest_name in remote_files:
+                        fs.get(f"{info['name']}/{_manifest_name}", str(staged / _manifest_name))
+                        manifest = _json.loads((staged / _manifest_name).read_text(encoding="utf-8"))
+                        _check_manifest(manifest, name)
+                        expected_files = manifest["files"]
+                    else:
+                        # Existing user backups have no manifest. Require the
+                        # full resume file set and advertised sizes; historical
+                        # corruption cannot be ruled out without prior hashes.
+                        expected_files = remote_files
+                        _check_required_files(expected_files)
+                        print(f"[Checkpoint Warning] Legacy {name}: validating required files and sizes; no prior hashes available.", flush=True)
+                    for fname, details in expected_files.items():
+                        if remote_files.get(fname, {}).get("size") != details["size"]:
+                            raise ValueError(f"Remote file missing or size mismatch: {fname}")
+                        fs.get(f"{info['name']}/{fname}", str(staged / fname))
+                        if (staged / fname).stat().st_size != details["size"]:
+                            raise ValueError(f"Downloaded file size mismatch: {fname}")
+                    _validate_local_checkpoint(staged)
+                    restored = local_ckpt_dir / name
+                    staged.rename(restored)
+                local_ckpts.append(restored)
+                if manifest is not None:
+                    # Only a backup actually restored and verified this run is
+                    # known to exist remotely. Other local checkpoints must sync.
+                    uploaded_ckpts.add(name)
+                print(f"[Checkpoint] Restored validated {name}.", flush=True)
+                break
+            except Exception as e:
+                _had_invalid_checkpoint = True
+                print(f"[Checkpoint Warning] Skipping {name}: {e}", flush=True)
+    if not local_ckpts and _had_invalid_checkpoint:
+        raise RuntimeError(
+            "Existing checkpoints failed validation; training was not started from scratch. "
+            "See the checkpoint warnings above; rejected local files, if any, are preserved in .incomplete."
+        )
 
     stage1_cmd = [
         TORCHRUN_BIN,
@@ -667,24 +855,23 @@ def _(ROOT_DIR, TORCHRUN_BIN, clean_env, fs, subprocess):
                 return
             _sync_busy.set()
             try:
-                # Preserve the existing checkpoint selection/upload behavior.
-                # trainer_state.json is the launcher's local readiness marker.
+                # trainer_state.json is an initial readiness hint; the upload
+                # helper validates all required resume files before publishing.
                 if local_ckpt_dir.exists():
                     for ckpt in sorted(local_ckpt_dir.glob("checkpoint-*")):
                         if _cancel_sync.is_set():
                             return
                         if ckpt.name not in uploaded_ckpts and (ckpt / "trainer_state.json").is_file():
                             _sync_messages.put(f"[Drive Sync] Uploading {ckpt.name}...")
-                            _upload_dir(ckpt, f"{remote_dir}/{ckpt.name}")
-                            uploaded_ckpts.add(ckpt.name)
+                            if _upload_checkpoint(ckpt, f"{remote_dir}/{ckpt.name}"):
+                                uploaded_ckpts.add(ckpt.name)
                     if final_pass:
                         for item in local_ckpt_dir.iterdir():
                             _upload_file(item, f"{remote_dir}/{item.name}")
 
                 _upload_file(log_file, f"{remote_dir}/stage1_training.log")
                 if not audit_uploaded and audit_file.is_file():
-                    _upload_file(audit_file, f"{remote_dir}/qa_format_audit.json")
-                    audit_uploaded = True
+                    audit_uploaded = _upload_file(audit_file, f"{remote_dir}/qa_format_audit.json")
             except Exception as e:
                 # For example, Trainer may rotate a checkpoint while we scan
                 # local files. A backup error must not terminate monitoring.
