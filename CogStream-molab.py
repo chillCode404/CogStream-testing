@@ -29,6 +29,32 @@ def _():
     return Path, os, subprocess
 
 
+@app.cell
+def _(mo):
+    from gdrive_fsspec import GoogleDriveFileSystem
+
+    fs = GoogleDriveFileSystem(use_listings_cache=False, skip_instance_cache=True, auth_kwargs={"use_local_webserver": False})
+    mo.output.clear_console()
+    return (fs,)
+
+
+@app.cell
+def _(fs):
+    # List only folders using detail=True (fewer API calls)
+    all_items = fs.ls("Thesis-Data/CogStream-testing", detail=True)
+
+    # Items are returned as a list of info dictionaries
+    folders_only = [info["name"] for info in all_items if info.get("type") == "directory"]
+    folders_only
+    return
+
+
+@app.cell
+def _(fs):
+    print(type(fs), fs.protocol)
+    return
+
+
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
@@ -527,13 +553,55 @@ def _(mo):
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    ### Stage 1 (Historic Dialogue Retrieval) Training
+    ## Stage 1: Historic Dialogue Retrieval
     """)
     return
 
 
 @app.cell
-def _(ROOT_DIR, TORCHRUN_BIN, clean_env, subprocess):
+def _(ROOT_DIR, TORCHRUN_BIN, clean_env, fs, subprocess):
+    remote_dir = "Thesis-Data/CogStream-testing/HDR_checkpoints"
+    local_ckpt_dir = ROOT_DIR / "stage1_lora_weights_custom"
+    log_file = ROOT_DIR / "stage1_training.log"
+    audit_file = ROOT_DIR / "qa_format_audit.json"
+
+    def _upload_file(local_path, remote_path):
+        if local_path.is_file():
+            try:
+                fs.put(str(local_path), remote_path)
+            except Exception as e:
+                print(f"[Drive Sync Warning] Failed to upload {local_path.name}: {e}", flush=True)
+
+    def _upload_dir(local_dir, remote_target):
+        try:
+            fs.makedirs(remote_target, exist_ok=True)
+            for item in local_dir.iterdir():
+                if item.is_file():
+                    fs.put(str(item), f"{remote_target}/{item.name}")
+        except Exception as e:
+            print(f"[Drive Sync Warning] Failed to upload {local_dir.name}: {e}", flush=True)
+
+    # 1. Restore existing checkpoints from Google Drive if local directory has none
+    local_ckpts = list(local_ckpt_dir.glob("checkpoint-*")) if local_ckpt_dir.exists() else []
+    if not local_ckpts and fs.exists(remote_dir):
+        print(f"Checking {remote_dir} for existing checkpoints to resume...", flush=True)
+        for info in fs.ls(remote_dir, detail=True):
+            name = info["name"].rstrip("/").split("/")[-1]
+            if info.get("type") == "directory" and name.startswith("checkpoint-"):
+                target_dir = local_ckpt_dir / name
+                target_dir.mkdir(parents=True, exist_ok=True)
+                print(f"Downloading {name} from Google Drive...", flush=True)
+                for f_info in fs.ls(info["name"], detail=True):
+                    if f_info.get("type") != "directory":
+                        fname = f_info["name"].rstrip("/").split("/")[-1]
+                        fs.get(f_info["name"], str(target_dir / fname))
+
+
+    uploaded_ckpts = {
+        p.name for p in local_ckpt_dir.glob("checkpoint-*")
+        if (p / "trainer_state.json").is_file()
+    } if local_ckpt_dir.exists() else set()
+
     stage1_cmd = [
         TORCHRUN_BIN,
         "--nproc_per_node=1",
@@ -543,20 +611,53 @@ def _(ROOT_DIR, TORCHRUN_BIN, clean_env, subprocess):
         "--resume_from_checkpoint", "./stage1_lora_weights_custom"
     ]
 
-    log_file = ROOT_DIR / "stage1_training.log"
-    print(f"Starting Stage 1 training (Historic Dialogue Retrieval)...", flush=True)
+    print("Starting Stage 1 training (Historic Dialogue Retrieval)...", flush=True)
     print(f"All output is being written to: {log_file}", flush=True)
-    print(f"Monitor in real time from the Molab terminal with:", flush=True)
-    print(f"    tail -f {log_file}", flush=True)
+    print(f"Checkpoints & logs will auto-sync to Google Drive: {remote_dir}", flush=True)
+    print(f"Monitor in real time from the Molab terminal with:\n    tail -f {log_file}", flush=True)
 
+    audit_uploaded = False
     with open(log_file, "w") as f:
-        result = subprocess.run(
+        proc = subprocess.Popen(
             stage1_cmd,
             cwd=str(ROOT_DIR),
             env=clean_env,
             stdout=f,
             stderr=subprocess.STDOUT,
         )
+
+        while proc.poll() is None:
+            try:
+                proc.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                pass
+
+            # Sync completed checkpoints (trainer_state.json is written last)
+            if local_ckpt_dir.exists():
+                for ckpt in sorted(local_ckpt_dir.glob("checkpoint-*")):
+                    if ckpt.name not in uploaded_ckpts and (ckpt / "trainer_state.json").is_file():
+                        print(f"[Drive Sync] Uploading {ckpt.name}...", flush=True)
+                        _upload_dir(ckpt, f"{remote_dir}/{ckpt.name}")
+                        uploaded_ckpts.add(ckpt.name)
+
+            # Sync training log and audit file
+            _upload_file(log_file, f"{remote_dir}/stage1_training.log")
+            if not audit_uploaded and audit_file.is_file():
+                _upload_file(audit_file, f"{remote_dir}/qa_format_audit.json")
+                audit_uploaded = True
+
+    # Final sync after process exits
+    if local_ckpt_dir.exists():
+        for ckpt in sorted(local_ckpt_dir.glob("checkpoint-*")):
+            if ckpt.name not in uploaded_ckpts and (ckpt / "trainer_state.json").is_file():
+                _upload_dir(ckpt, f"{remote_dir}/{ckpt.name}")
+                uploaded_ckpts.add(ckpt.name)
+        for item in local_ckpt_dir.iterdir():
+            if item.is_file():
+                _upload_file(item, f"{remote_dir}/{item.name}")
+    _upload_file(log_file, f"{remote_dir}/stage1_training.log")
+    if not audit_uploaded and audit_file.is_file():
+        _upload_file(audit_file, f"{remote_dir}/qa_format_audit.json")
 
     # Print the tail of the log so the cell shows final status
     with open(log_file, "r") as f:
@@ -566,25 +667,8 @@ def _(ROOT_DIR, TORCHRUN_BIN, clean_env, subprocess):
         for line in tail:
             print(line, end="", flush=True)
 
-    if result.returncode != 0:
-        raise subprocess.CalledProcessError(result.returncode, stage1_cmd)
-    return
-
-
-@app.cell
-def _(ROOT_DIR):
-    """Run this cell to check training progress while the training cell is running."""
-    log_file = ROOT_DIR / "stage1_training.log"
-    if log_file.exists():
-        with open(log_file, "r") as f:
-            lines = f.readlines()
-        # Show last 30 lines
-        tail = lines[-30:] if len(lines) > 30 else lines
-        print(f"--- {log_file} ({len(lines)} lines total, showing last {len(tail)}) ---")
-        for line in tail:
-            print(line, end="")
-    else:
-        print(f"No log file found at {log_file}. Training has not started yet.")
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, stage1_cmd)
     return
 
 
