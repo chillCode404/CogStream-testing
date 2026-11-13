@@ -560,26 +560,64 @@ def _(mo):
 
 @app.cell
 def _(ROOT_DIR, TORCHRUN_BIN, clean_env, fs, subprocess):
+    from collections import deque
+    from queue import Empty, SimpleQueue
+    from threading import Event, Thread, enumerate as _enumerate_threads
+    from time import monotonic
+
+    # A timed-out wait does not kill an in-flight HTTP request. Refuse a rerun
+    # while the previous worker is still alive, before touching fs or the log.
+    if any(thread.name == "stage1-drive-sync" for thread in _enumerate_threads()):
+        raise RuntimeError(
+            "The previous Stage 1 Drive worker is still finishing a request. "
+            "Wait for it to finish before rerunning this cell to avoid competing uploads."
+        )
+
     remote_dir = "Thesis-Data/CogStream-testing/HDR_checkpoints"
     local_ckpt_dir = ROOT_DIR / "stage1_lora_weights_custom"
     log_file = ROOT_DIR / "stage1_training.log"
     audit_file = ROOT_DIR / "qa_format_audit.json"
 
+    # Drive requests may spend a long time retrying. Keep all uploads in one
+    # worker so those requests cannot block supervision of the training process.
+    # These intervals control backup frequency, status reporting, and how long
+    # the cell waits for backups AFTER it has already reported training's exit.
+    _sync_interval_seconds = 60
+    _heartbeat_interval_seconds = 60
+    _monitor_interval_seconds = 1
+    _final_sync_wait_seconds = 30
+    _training_finished = Event()
+    _cancel_sync = Event()
+    _sync_busy = Event()
+    _sync_messages = SimpleQueue()
+
+    def _drain_sync_messages():
+        # Print from the cell's thread so worker messages reach notebook output.
+        while True:
+            try:
+                print(_sync_messages.get_nowait(), flush=True)
+            except Empty:
+                break
+
     def _upload_file(local_path, remote_path):
-        if local_path.is_file():
+        if not _cancel_sync.is_set() and local_path.is_file():
             try:
                 fs.put(str(local_path), remote_path)
             except Exception as e:
-                print(f"[Drive Sync Warning] Failed to upload {local_path.name}: {e}", flush=True)
+                _sync_messages.put(f"[Drive Sync Warning] Failed to upload {local_path.name}: {e}")
 
     def _upload_dir(local_dir, remote_target):
+        if _cancel_sync.is_set():
+            return
         try:
             fs.makedirs(remote_target, exist_ok=True)
             for item in local_dir.iterdir():
+                if _cancel_sync.is_set():
+                    return
                 if item.is_file():
                     fs.put(str(item), f"{remote_target}/{item.name}")
         except Exception as e:
-            print(f"[Drive Sync Warning] Failed to upload {local_dir.name}: {e}", flush=True)
+            _sync_messages.put(f"[Drive Sync Warning] Failed to upload {local_dir.name}: {e}")
 
     # 1. Restore existing checkpoints from Google Drive if local directory has none
     local_ckpts = list(local_ckpt_dir.glob("checkpoint-*")) if local_ckpt_dir.exists() else []
@@ -616,59 +654,112 @@ def _(ROOT_DIR, TORCHRUN_BIN, clean_env, fs, subprocess):
     print(f"Checkpoints & logs will auto-sync to Google Drive: {remote_dir}", flush=True)
     print(f"Monitor in real time from the Molab terminal with:\n    tail -f {log_file}", flush=True)
 
-    audit_uploaded = False
-    with open(log_file, "w") as f:
-        proc = subprocess.Popen(
-            stage1_cmd,
-            cwd=str(ROOT_DIR),
-            env=clean_env,
-            stdout=f,
-            stderr=subprocess.STDOUT,
-        )
-
-        while proc.poll() is None:
+    def _drive_sync_worker():
+        # This worker alone owns upload bookkeeping and uses fs after restore.
+        # Never start a second uploader if this one stalls: that would pile up
+        # requests and permit concurrent writes to the same remote files.
+        audit_uploaded = False
+        while not _cancel_sync.is_set():
+            # Setting this event wakes the worker for a final pass immediately,
+            # rather than waiting out the normal 60-second backup interval.
+            final_pass = _training_finished.wait(_sync_interval_seconds)
+            if _cancel_sync.is_set():
+                return
+            _sync_busy.set()
             try:
-                proc.wait(timeout=60)
-            except subprocess.TimeoutExpired:
-                pass
+                # Preserve the existing checkpoint selection/upload behavior.
+                # trainer_state.json is the launcher's local readiness marker.
+                if local_ckpt_dir.exists():
+                    for ckpt in sorted(local_ckpt_dir.glob("checkpoint-*")):
+                        if _cancel_sync.is_set():
+                            return
+                        if ckpt.name not in uploaded_ckpts and (ckpt / "trainer_state.json").is_file():
+                            _sync_messages.put(f"[Drive Sync] Uploading {ckpt.name}...")
+                            _upload_dir(ckpt, f"{remote_dir}/{ckpt.name}")
+                            uploaded_ckpts.add(ckpt.name)
+                    if final_pass:
+                        for item in local_ckpt_dir.iterdir():
+                            _upload_file(item, f"{remote_dir}/{item.name}")
 
-            # Sync completed checkpoints (trainer_state.json is written last)
-            if local_ckpt_dir.exists():
-                for ckpt in sorted(local_ckpt_dir.glob("checkpoint-*")):
-                    if ckpt.name not in uploaded_ckpts and (ckpt / "trainer_state.json").is_file():
-                        print(f"[Drive Sync] Uploading {ckpt.name}...", flush=True)
-                        _upload_dir(ckpt, f"{remote_dir}/{ckpt.name}")
-                        uploaded_ckpts.add(ckpt.name)
+                _upload_file(log_file, f"{remote_dir}/stage1_training.log")
+                if not audit_uploaded and audit_file.is_file():
+                    _upload_file(audit_file, f"{remote_dir}/qa_format_audit.json")
+                    audit_uploaded = True
+            except Exception as e:
+                # For example, Trainer may rotate a checkpoint while we scan
+                # local files. A backup error must not terminate monitoring.
+                _sync_messages.put(f"[Drive Sync Warning] Backup pass failed: {e}")
+            finally:
+                _sync_busy.clear()
+            if final_pass:
+                return
 
-            # Sync training log and audit file
-            _upload_file(log_file, f"{remote_dir}/stage1_training.log")
-            if not audit_uploaded and audit_file.is_file():
-                _upload_file(audit_file, f"{remote_dir}/qa_format_audit.json")
-                audit_uploaded = True
+    # A daemon worker cannot keep the notebook kernel alive during shutdown.
+    # Python cannot forcibly stop a thread inside fs.put(); cancellation below
+    # prevents subsequent uploads once that outstanding request returns.
+    _sync_thread = Thread(target=_drive_sync_worker, name="stage1-drive-sync", daemon=True)
+    try:
+        with open(log_file, "w") as f:
+            proc = subprocess.Popen(
+                stage1_cmd,
+                cwd=str(ROOT_DIR),
+                # Flush Python output promptly into the local log, including
+                # output from workers launched by torchrun. Leave clean_env intact.
+                env={**clean_env, "PYTHONUNBUFFERED": "1"},
+                stdout=f,
+                stderr=subprocess.STDOUT,
+            )
+            _sync_thread.start()
+            _next_heartbeat = monotonic() + _heartbeat_interval_seconds
+            while True:
+                try:
+                    proc.wait(timeout=_monitor_interval_seconds)
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+                _drain_sync_messages()
+                if monotonic() >= _next_heartbeat:
+                    # Process liveness is not proof of optimizer progress. The
+                    # local log size helps distinguish it from a stale Drive copy.
+                    _sync_status = "busy" if _sync_busy.is_set() else "waiting"
+                    print(
+                        f"[Stage 1] Training process {proc.pid} is still running; "
+                        f"local log: {log_file.stat().st_size:,} bytes; "
+                        f"Drive sync: {_sync_status}.",
+                        flush=True,
+                    )
+                    _next_heartbeat = monotonic() + _heartbeat_interval_seconds
 
-    # Final sync after process exits
-    if local_ckpt_dir.exists():
-        for ckpt in sorted(local_ckpt_dir.glob("checkpoint-*")):
-            if ckpt.name not in uploaded_ckpts and (ckpt / "trainer_state.json").is_file():
-                _upload_dir(ckpt, f"{remote_dir}/{ckpt.name}")
-                uploaded_ckpts.add(ckpt.name)
-        for item in local_ckpt_dir.iterdir():
-            if item.is_file():
-                _upload_file(item, f"{remote_dir}/{item.name}")
-    _upload_file(log_file, f"{remote_dir}/stage1_training.log")
-    if not audit_uploaded and audit_file.is_file():
-        _upload_file(audit_file, f"{remote_dir}/qa_format_audit.json")
+        # Report the LOCAL result before requesting or waiting for final backup.
+        # Even if Drive is stuck, a CUDA traceback/torchrun failure is visible now.
+        print(f"\n[Stage 1] Training process exited with code {proc.returncode}.", flush=True)
+        print("\n--- Last 50 lines of local training log ---", flush=True)
+        with open(log_file, "r", encoding="utf-8", errors="replace") as f:
+            for line in deque(f, maxlen=50):
+                print(line, end="", flush=True)
+        _drain_sync_messages()
 
-    # Print the tail of the log so the cell shows final status
-    with open(log_file, "r") as f:
-        lines = f.readlines()
-        tail = lines[-50:] if len(lines) > 50 else lines
-        print("\n--- Last 50 lines of training log ---", flush=True)
-        for line in tail:
-            print(line, end="", flush=True)
+        _training_finished.set()
+        print(f"\n[Drive Sync] Waiting up to {_final_sync_wait_seconds}s for final backup...", flush=True)
+        _sync_thread.join(timeout=_final_sync_wait_seconds)
+        if _sync_thread.is_alive():
+            _cancel_sync.set()
+            print(
+                "[Drive Sync Warning] Final backup wait expired; remote files may be stale or incomplete. "
+                "An in-flight Drive request may still finish, but no further uploads will start. "
+                f"Local training output remains at {ROOT_DIR}.",
+                flush=True,
+            )
+        _drain_sync_messages()
 
-    if proc.returncode != 0:
-        raise subprocess.CalledProcessError(proc.returncode, stage1_cmd)
+        # Backup timing/errors cannot replace the training process's exit code.
+        if proc.returncode != 0:
+            raise subprocess.CalledProcessError(proc.returncode, stage1_cmd)
+        print("[Stage 1] Training completed successfully.", flush=True)
+    finally:
+        # Also wake/cancel an idle backup worker if the cell is interrupted.
+        _cancel_sync.set()
+        _training_finished.set()
     return
 
 
